@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use iroh::{
-    client::{LiveEvent, Entry, mem::Doc},
+    client::{mem::Doc, Entry, LiveEvent},
     node::{Builder, Node},
     rpc_protocol::ShareMode,
 };
