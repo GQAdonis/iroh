@@ -1229,6 +1229,7 @@ impl MagicSock {
         });
 
         let inner2 = inner.clone();
+        let network_monitor = netmon::Monitor::new().await?;
         let main_actor_task = tokio::task::spawn(
             async move {
                 let actor = Actor {
@@ -1246,6 +1247,7 @@ impl MagicSock {
                     no_v4_send: false,
                     net_checker,
                     udp_disco_sender_task,
+                    network_monitor,
                 };
 
                 if let Err(err) = actor.run().await {
@@ -1393,6 +1395,15 @@ impl MagicSock {
     pub fn discovery(&self) -> Option<&dyn Discovery> {
         self.inner.discovery.as_ref().map(Box::as_ref)
     }
+
+    /// Call to notify the system of potential network changes.
+    pub async fn network_change(&self) {
+        self.inner
+            .actor_sender
+            .send(ActorMessage::NetworkChange)
+            .await
+            .ok();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1520,6 +1531,7 @@ enum ActorMessage {
     ReceiveDerp(DerpReadResult),
     EndpointPingExpired(usize, stun::TransactionId),
     NetcheckReport(Result<Option<Arc<netcheck::Report>>>, &'static str),
+    NetworkChange,
 }
 
 struct Actor {
@@ -1553,34 +1565,20 @@ struct Actor {
 
     /// Task that sends disco messages over UDP.
     udp_disco_sender_task: tokio::task::JoinHandle<()>,
+
+    network_monitor: netmon::Monitor,
 }
 
 impl Actor {
     async fn run(mut self) -> Result<()> {
         // Setup network monitoring
-        let monitor = netmon::Monitor::new().await?;
-        let inner = self.inner.clone();
-        let _token = monitor
+        let (link_change_s, mut link_change_r) = mpsc::channel(8);
+        let _token = self
+            .network_monitor
             .subscribe(move |is_major| {
-                let inner = inner.clone();
+                let link_change_s = link_change_s.clone();
                 async move {
-                    info!("link change detected: major? {}", is_major);
-
-                    // Clear DNS cache
-                    DNS_RESOLVER.clear_cache();
-
-                    if is_major {
-                        let (s, r) = sync::oneshot::channel();
-                        inner.re_stun("link-change-major");
-                        inner
-                            .actor_sender
-                            .send(ActorMessage::RebindAll(s))
-                            .await
-                            .ok();
-                        r.await.ok();
-                    } else {
-                        inner.re_stun("link-change-minor");
-                    }
+                    link_change_s.send(is_major).await.ok();
                 }
                 .boxed()
             })
@@ -1644,10 +1642,33 @@ impl Actor {
                         Err(e) => debug!(%e, "failed to persist known nodes"),
                     }
                 }
+                Some(is_major) = link_change_r.recv() => {
+                    self.handle_network_change(is_major).await;
+                }
                 else => {
                     trace!("tick: other");
                 }
             }
+        }
+    }
+
+    async fn handle_network_change(&mut self, is_major: bool) {
+        info!("link change detected: major? {}", is_major);
+
+        if is_major {
+            // Clear DNS cache
+            DNS_RESOLVER.clear_cache();
+
+            let (s, r) = sync::oneshot::channel();
+            self.inner.re_stun("link-change-major");
+            self.inner
+                .actor_sender
+                .send(ActorMessage::RebindAll(s))
+                .await
+                .ok();
+            r.await.ok();
+        } else {
+            self.inner.re_stun("link-change-minor");
         }
     }
 
@@ -1748,6 +1769,9 @@ impl Actor {
                     }
                 }
                 self.finalize_endpoints_update(why);
+            }
+            ActorMessage::NetworkChange => {
+                self.network_monitor.network_change().await.ok();
             }
         }
 

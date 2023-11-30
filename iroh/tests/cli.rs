@@ -2,6 +2,7 @@
 #![cfg(feature = "cli")]
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -13,13 +14,12 @@ use duct::{cmd, ReaderHandle};
 use iroh::bytes::Hash;
 use iroh::ticket::blob::Ticket;
 use iroh::util::path::IrohPaths;
+use iroh_bytes::HashAndFormat;
 use rand::distributions::{Alphanumeric, DistString};
 use rand::{Rng, SeedableRng};
 use regex::Regex;
 use testdir::testdir;
 use walkdir::WalkDir;
-
-const RPC_PORT: &str = "4999";
 
 fn make_rand_file(size: usize, path: &Path) -> Result<Hash> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(1);
@@ -159,8 +159,9 @@ enum MakePartialResult {
 /// Take an iroh_data_dir containing a flat file database and convert some of the files to partial files.
 #[cfg(feature = "flat-db")]
 fn make_partial(dir: impl AsRef<Path>, op: impl Fn(Hash, u64) -> MakePartialResult) -> Result<()> {
-    let complete_dir = IrohPaths::BaoFlatStoreComplete.with_root(&dir);
-    let partial_dir = IrohPaths::BaoFlatStorePartial.with_root(&dir);
+    let bao_root = IrohPaths::BaoFlatStoreDir.with_root(&dir);
+    let complete_dir = bao_root.join("complete");
+    let partial_dir = bao_root.join("partial");
     use iroh_bytes::store::flat::FileName;
     let mut files = BTreeMap::<Hash, (Option<u64>, bool)>::new();
     for entry in std::fs::read_dir(&complete_dir)
@@ -226,14 +227,8 @@ fn make_partial(dir: impl AsRef<Path>, op: impl Fn(Hash, u64) -> MakePartialResu
 }
 
 fn copy_blob_dirs(src: &Path, tgt: &Path) -> Result<()> {
-    let dirs = [
-        IrohPaths::BaoFlatStoreComplete,
-        IrohPaths::BaoFlatStorePartial,
-        IrohPaths::BaoFlatStoreMeta,
-    ];
-    for dir in dirs.into_iter() {
-        copy_dir_all(&dir.clone().with_root(src), &dir.with_root(tgt))?;
-    }
+    let dir = &IrohPaths::BaoFlatStoreDir;
+    copy_dir_all(dir.with_root(src), dir.with_root(tgt))?;
     Ok(())
 }
 
@@ -266,7 +261,7 @@ fn cli_provide_tree_resume() -> Result<()> {
         make_rand_file(5000, &file3)?;
     }
     // leave the provider running for the entire test
-    let provider = make_provider_in(&src_iroh_data_dir, Input::Path(src.clone()), false, None)?;
+    let provider = make_provider_in(&src_iroh_data_dir, Input::Path(src.clone()), false)?;
     let count = count_input_files(&src);
     let ticket = match_provide_output(&provider, count, BlobOrCollection::Collection)?;
     {
@@ -349,6 +344,97 @@ fn cli_provide_from_stdin_to_stdout() -> Result<()> {
     test_provide_get_loop(Input::Stdin(path), Output::Stdout)
 }
 
+/// Creates a v0 flat store in the given directory.
+fn init_v0_blob_store(iroh_data_dir: &Path) -> anyhow::Result<()> {
+    let complete_v0 = iroh_data_dir.join("blobs.v0");
+    let partial_v0 = iroh_data_dir.join("blobs-partial.v0");
+    let meta_v0 = iroh_data_dir.join("blobs-meta.v0");
+    std::fs::create_dir_all(&complete_v0)?;
+    std::fs::create_dir_all(&partial_v0)?;
+    std::fs::create_dir_all(&meta_v0)?;
+    let complete = b"complete";
+    let partial = vec![0u8; 1024 * 17];
+    let complete_hash = blake3::hash(complete).into();
+    let partial_hash = blake3::hash(&partial).into();
+    let mut tags = BTreeMap::<String, HashAndFormat>::new();
+    tags.insert("complete".to_string(), HashAndFormat::raw(complete_hash));
+    tags.insert("partial".to_string(), HashAndFormat::raw(partial_hash));
+    let tags = postcard::to_stdvec(&tags)?;
+    let uuid = [0u8; 16];
+    std::fs::write(
+        complete_v0.join(format!("{}.data", complete_hash.to_hex())),
+        complete,
+    )?;
+    std::fs::write(
+        partial_v0.join(format!(
+            "{}-{}.data",
+            partial_hash.to_hex(),
+            hex::encode(uuid)
+        )),
+        partial,
+    )?;
+    std::fs::write(
+        partial_v0.join(format!(
+            "{}-{}.obao4",
+            partial_hash.to_hex(),
+            hex::encode(uuid)
+        )),
+        vec![],
+    )?;
+    std::fs::write(meta_v0.join("tags.meta"), tags)?;
+    Ok(())
+}
+
+fn run_cli(
+    iroh_data_dir: impl Into<OsString>,
+    args: impl IntoIterator<Item = impl Into<OsString>>,
+) -> anyhow::Result<String> {
+    let output = cmd(iroh_bin(), args)
+        .env_remove("RUST_LOG")
+        .env("IROH_DATA_DIR", iroh_data_dir)
+        // .stderr_file(std::io::stderr().as_raw_fd()) // for debug output
+        .stdout_capture()
+        .run()?;
+    let text = String::from_utf8(output.stdout)?;
+    Ok(text)
+}
+
+#[cfg(feature = "cli")]
+#[test]
+fn cli_bao_store_migration() -> anyhow::Result<()> {
+    let dir = testdir!();
+    let iroh_data_dir = dir.join("iroh_data_dir");
+    init_v0_blob_store(&iroh_data_dir)?;
+    let mut reader_handle = cmd(iroh_bin(), ["start"])
+        .env_remove("RUST_LOG")
+        .env("IROH_DATA_DIR", &iroh_data_dir)
+        .stderr_to_stdout()
+        .reader()?;
+
+    assert_matches_line(
+        BufReader::new(&mut reader_handle),
+        [(r"Iroh is running", 1), (r"Node ID: [_\w\d-]*", 1)],
+    );
+
+    println!("iroh started up.");
+    let tags_output = run_cli(&iroh_data_dir, ["tag", "list"])?;
+    let expected = r#""complete": 2vfkw5gcrtbybfsczoxq4mae47svtgcgsniwcvoz7xf36nz45yfa (Raw)
+"partial": 4yny3v7anmzzsajv2amm3nxpqd2owfw4dqnjwq6anv7nj2djmt2q (Raw)
+"#;
+    assert_eq!(tags_output, expected);
+
+    let blob_output = run_cli(&iroh_data_dir, ["blob", "list", "blobs"])?;
+    let expected = r#" 2vfkw5gcrtbybfsczoxq4mae47svtgcgsniwcvoz7xf36nz45yfa (8 B)
+"#;
+    assert_eq!(blob_output, expected);
+
+    let incomplete_blob_output = run_cli(iroh_data_dir, ["blob", "list", "incomplete-blobs"])?;
+    let expected = r#"4yny3v7anmzzsajv2amm3nxpqd2owfw4dqnjwq6anv7nj2djmt2q 0
+"#;
+    assert_eq!(incomplete_blob_output, expected);
+    Ok(())
+}
+
 #[cfg(all(unix, feature = "cli"))]
 #[test]
 fn cli_provide_persistence() -> anyhow::Result<()> {
@@ -372,14 +458,7 @@ fn cli_provide_persistence() -> anyhow::Result<()> {
     let iroh_provide = |path: &PathBuf| {
         cmd(
             iroh_bin(),
-            [
-                "start",
-                "--rpc-port",
-                "0",
-                "--add",
-                path.to_str().unwrap(),
-                "--wrap",
-            ],
+            ["start", "--add", path.to_str().unwrap(), "--wrap"],
         )
         .env("IROH_DATA_DIR", &iroh_data_dir)
         .env_remove("RUST_LOG")
@@ -408,14 +487,14 @@ fn cli_provide_persistence() -> anyhow::Result<()> {
     };
     provide(&foo_path)?;
     // should have some data now
-    let db_path = IrohPaths::BaoFlatStoreComplete.with_root(&iroh_data_dir);
-    let db = Store::load_blocking(&db_path, &db_path, &db_path)?;
+    let db_path = IrohPaths::BaoFlatStoreDir.with_root(&iroh_data_dir);
+    let db = Store::load_blocking(&db_path)?;
     let blobs = db.blobs().collect::<Vec<_>>();
     assert_eq!(blobs.len(), 3);
 
     provide(&bar_path)?;
     // should have more data now
-    let db = Store::load_blocking(&db_path, &db_path, &db_path)?;
+    let db = Store::load_blocking(&db_path)?;
     let blobs = db.blobs().collect::<Vec<_>>();
     assert_eq!(blobs.len(), 6);
 
@@ -429,7 +508,7 @@ fn cli_provide_addresses() -> Result<()> {
     make_rand_file(1000, &path)?;
 
     let iroh_data_dir = dir.join("iroh-data-dir");
-    let mut provider = make_provider_in(&iroh_data_dir, Input::Path(path), true, Some(RPC_PORT))?;
+    let mut provider = make_provider_in(&iroh_data_dir, Input::Path(path), true)?;
     // wait for the provider to start
     let _ticket = match_provide_output(&mut provider, 1, BlobOrCollection::Collection)?;
 
@@ -466,7 +545,7 @@ fn cli_rpc_lock_restart() -> Result<()> {
     let iroh_data_dir = dir.join("data-dir");
 
     println!("start");
-    let mut reader_handle = cmd(iroh_bin(), vec!["start", "--rpc-port", "0"])
+    let mut reader_handle = cmd(iroh_bin(), ["start"])
         .env_remove("RUST_LOG")
         .env("IROH_DATA_DIR", &iroh_data_dir)
         .stderr_to_stdout()
@@ -478,8 +557,10 @@ fn cli_rpc_lock_restart() -> Result<()> {
     );
 
     // check for the lock file
-    let content = std::fs::read(IrohPaths::RpcLock.with_root(&iroh_data_dir))?;
-    let rpc_port = u16::from_le_bytes(content[..2].try_into().unwrap());
+    assert!(
+        IrohPaths::RpcLock.with_root(&iroh_data_dir).exists(),
+        "missing lock file"
+    );
 
     // kill process
     println!("killing process");
@@ -493,14 +574,11 @@ fn cli_rpc_lock_restart() -> Result<()> {
 
     // Restart should work fine
     println!("restart");
-    let mut reader_handle = cmd(
-        iroh_bin(),
-        vec!["start", "--rpc-port", &rpc_port.to_string()],
-    )
-    .env_remove("RUST_LOG")
-    .env("IROH_DATA_DIR", &iroh_data_dir)
-    .stderr_to_stdout()
-    .reader()?;
+    let mut reader_handle = cmd(iroh_bin(), ["start"])
+        .env_remove("RUST_LOG")
+        .env("IROH_DATA_DIR", &iroh_data_dir)
+        .stderr_to_stdout()
+        .reader()?;
 
     assert_matches_line(
         BufReader::new(&mut reader_handle),
@@ -508,19 +586,16 @@ fn cli_rpc_lock_restart() -> Result<()> {
     );
 
     println!("double start");
-    let output = cmd(
-        iroh_bin(),
-        vec!["start", "--rpc-port", &rpc_port.to_string()],
-    )
-    .env_remove("RUST_LOG")
-    .env("IROH_DATA_DIR", &iroh_data_dir)
-    .stderr_capture()
-    .unchecked()
-    .run()?;
+    let output = cmd(iroh_bin(), ["start"])
+        .env_remove("RUST_LOG")
+        .env("IROH_DATA_DIR", &iroh_data_dir)
+        .stderr_capture()
+        .unchecked()
+        .run()?;
 
     let output = std::str::from_utf8(&output.stderr).unwrap();
     println!("{}", output);
-    assert!(output.contains(&format!("iroh is already running on port {}", rpc_port)));
+    assert!(output.contains("iroh is already running on port"));
 
     Ok(())
 }
@@ -586,13 +661,8 @@ fn iroh_bin() -> &'static str {
 }
 
 /// Makes a provider process with it's home directory in `iroh_data_dir`.
-fn make_provider_in(
-    iroh_data_dir: &Path,
-    input: Input,
-    wrap: bool,
-    rpc_port: Option<&str>,
-) -> Result<ReaderHandle> {
-    let mut args = vec!["start", "--rpc-port", rpc_port.unwrap_or("0")];
+fn make_provider_in(iroh_data_dir: &Path, input: Input, wrap: bool) -> Result<ReaderHandle> {
+    let mut args = vec!["start"];
     if wrap {
         args.push("--wrap");
     }
@@ -683,7 +753,7 @@ fn test_provide_get_loop(input: Input, output: Output) -> Result<()> {
 
     let dir = testdir!();
     let iroh_data_dir = dir.join("iroh-data-dir");
-    let mut provider = make_provider_in(&iroh_data_dir, input.clone(), wrap, None)?;
+    let mut provider = make_provider_in(&iroh_data_dir, input.clone(), wrap)?;
 
     // test provide output & scrape the ticket from stderr
     let ticket = match_provide_output(&mut provider, num_blobs, input.is_blob_or_collection())?;
@@ -749,7 +819,7 @@ fn test_provide_get_loop_single(input: Input, output: Output, hash: Hash) -> Res
     let dir = testdir!();
     let iroh_data_dir = dir.join("iroh-data-dir");
 
-    let mut provider = make_provider_in(&iroh_data_dir, input.clone(), true, None)?;
+    let mut provider = make_provider_in(&iroh_data_dir, input.clone(), true)?;
 
     // test provide output & get all in one ticket from stderr
     let ticket = match_provide_output(&mut provider, num_blobs, BlobOrCollection::Collection)?;
